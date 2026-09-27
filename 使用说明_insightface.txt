@@ -1,0 +1,579 @@
+================================================================================
+InsightFace (buffalo_l) 人脸相似度工具包  使用说明
+================================================================================
+
+这是 dlib 人脸相似度工具包的 InsightFace 版本。同样的四个文件、同样的用法，
+换成 ArcFace 512 维向量，准确率明显高于 dlib 的 128 维向量。
+
+两者完全独立，各自单独用：
+  dlib 那套         dlib_face_similarity.py / example2.py / flask_dlib_face.py
+  InsightFace 这套  insightface_face_similarity.py / example2_insightface.py
+                    / flask_insightface_face.py
+不需要 dlib，也不需要那两个 .dat 模型文件。
+
+--------------------------------------------------------------------------------
+【最重要的提醒：两套的百分比不能互相比较】
+--------------------------------------------------------------------------------
+
+  dlib 版       128 维描述向量，同一个人通常 85% 以上
+  InsightFace   512 维 ArcFace 向量，同一个人通常 45 ~ 70
+
+同样是「本人和自己比」，两边都是 100.00%。
+但 dlib 的 60% 和 InsightFace 的 60% 说的不是一回事，阈值必须重新标定。
+
+本工具包只输出相似度，不判断「是不是同一个人」。要判断请自己定阈值，
+拿一批你已知同一人 / 不同人的样本跑一遍，看分数分布再决定。
+
+实测参考值（本机 buffalo_l，CPU）：
+
+  同一张图和自己比                        100.00%
+  同一张图，被检测器缩放后（拼成大合照再比）  95 ~ 97%
+  同一张图换个角度/表情/光线                 50 ~ 70
+  两个不同的人                              38 ~ 50
+  两个不同的人（差别较大）                  10 ~ 30
+
+不同的人也可能到 50%（长得像的双胞胎、撞脸），
+所以「高分」也不等于同一个人，低阈值会误判，高阈值会漏判。
+
+【一个容易踩的坑：脸在图里越小，分数越低】
+检测器固定按 640x640 看整张图。一张 4000x3000 的大合照会被缩到 640 宽，
+里面的人脸只剩几十像素，提取出来的特征就没那么稳：同一张脸
+单独放大看是 70%，塞进大合照里可能只有 50%。
+所以人脸库里的图和查询图分辨率接近时，分数才可比；
+拿一张几百像素的缩略图去搜 4K 大图，命中率会明显下降。
+遇到这种情况，把图先裁到人脸附近再比，会准很多。
+
+--------------------------------------------------------------------------------
+本压缩包共 4 个 Python 文件，彼此独立，可单独取用：
+
+  insightface_face_similarity.py  底层核心库。检测 + 特征提取 + 余弦相似度。
+                                  另外 3 个文件都用 from insightface_face_similarity
+                                  import ...，所以它必须能被 Python 找到，
+                                  通常就是和它们放在同一目录。
+  flask_insightface_face.py       网页版。两个面板：
+                                  ① 查询图 vs 候选图片（多选上传，1:N）
+                                  ② 查询图 vs 人脸库目录（1:N）
+                                  AJAX 橘红界面。
+  example2_insightface.py        命令行 + 双击工具。1:1 和 1:N 都支持。
+  example_insightface.py         最小示例，6 行，只演示最基础的 1:1 调用。
+
+依赖：Python 3、insightface、onnxruntime、numpy、opencv-python；
+      只有 flask_insightface_face.py 需要 Flask。
+
+  pip install insightface onnxruntime opencv-python numpy
+  pip install flask
+
+安装：python -m pip install insightface onnxruntime opencv-python
+  装完后运行本工具包任意一个文件，会自动从 InsightFace 官方模型库下载
+  buffalo_l 模型包（约 320 MB，其中本工具实际只用 2 个文件，194 MB），
+  放到：
+
+      Windows    C:\Users\<你的用户名>\.insightface\models\buffalo_l\
+      Linux/mac  ~/.insightface/models/buffalo_l/
+
+  只有第一次需要联网。下载失败就把 .onnx 文件手动放进去，或者用下面第三节
+  说的 INSIGHTFACE_MODEL_DIR 环境变量指到别处。
+
+
+================================================================================
+一、insightface_face_similarity.py（底层核心，重点看这一节）
+================================================================================
+
+这是整个工具包唯一真正干活的文件，其余三个都只是它的包装。
+
+--------------------------------------------------------------------------------
+【模型】
+--------------------------------------------------------------------------------
+
+  内核固定为 buffalo_l，一共只用两个模型：
+
+    det_10g.onnx      SCRFD 人脸检测，640x640 输入
+    w600k_r50.onnx    ArcFace w600k_r50 人脸特征，输出 512 维向量
+
+  buffalo_l 模型包里其实有 5 个文件，另外三个本工具一律不加载：
+    1k3d68.onnx      143 MB 的 3D 关键点模型，算相似度根本用不到
+    2d106det.onnx    106 点 2D 关键点模型，同上
+    genderage.onnx   性别年龄模型，同上
+
+  跳过它们是故意的，实测差别（同一台机器，纯 CPU）：
+
+    加载全部 5 个模型    1.45 秒，内存 449 MB
+    只加载 2 个模型      1.11 秒，内存 299 MB      ← 本工具的做法
+
+  如果有 NVIDIA 显卡且装好了 CUDA 版 onnxruntime，会自动用 GPU；
+  强制只用 CPU：设环境变量 INSIGHTFACE_PROVIDER=CPUExecutionProvider。
+  本工具的 CPU 速度：一张 2400x1080 的图约 0.13 ~ 0.23 秒。
+
+--------------------------------------------------------------------------------
+【模型查找顺序】按顺序找，找到就直接用，不会联网
+--------------------------------------------------------------------------------
+  1. 环境变量 INSIGHTFACE_MODEL_DIR 指向的目录
+     （既可以是直接放着 .onnx 的目录，也可以是它的上一级加 buffalo_l）
+  2. 本文件同级的 insightface_models\buffalo_l\ 和 models\buffalo_l\
+  3. 本文件同级的 buffalo_l\
+  4. 本文件所在目录下的所有子目录（递归查找 buffalo_l）
+  5. 环境变量 INSIGHTFACE_MODEL_ROOT 指向的 models\buffalo_l\
+  6. ~/.insightface/models/buffalo_l/
+
+  上面 6 处都找不到，就走 InsightFace 官方的下载流程。
+  放在本工具包外面、离线拷贝的机器都能用，放本文件同级最省事：
+
+      把整个 buffalo_l 文件夹拷到 insightface_face_similarity.py 同级目录，
+      即  insightface_face_similarity.py
+           buffalo_l\det_10g.onnx
+           buffalo_l\w600k_r50.onnx
+      之后不联网也能跑。
+
+--------------------------------------------------------------------------------
+【环境变量】
+--------------------------------------------------------------------------------
+  INSIGHTFACE_MODEL_ROOT       模型根目录，默认 ~/.insightface
+  INSIGHTFACE_MODEL_DIR        直接指定放 .onnx 的目录，跳过自动查找
+  INSIGHTFACE_PROVIDER         onnxruntime 执行后端，默认自动（有 CUDA 就用 CUDA）
+  INSIGHTFACE_FACE_LIBRARY_DIR 网页版人脸库目录，默认脚本同级的 face_library\
+  PORT                        网页版起始端口，默认 5000
+
+--------------------------------------------------------------------------------
+【公开常量】
+--------------------------------------------------------------------------------
+  ImageInput = str | pathlib.Path | bytes | bytearray | numpy.ndarray
+  MODEL_NAME = 'buffalo_l'
+  DESCRIPTOR_DIMENSION = 512
+  DET_SIZE = (640, 640)
+  DET_THRESHOLD = 0.5
+  DETECTOR_FILE / RECOGNIZER_FILE / REQUIRED_FILES
+  MODEL_ROOT_ENVIRONMENT_VARIABLE = 'INSIGHTFACE_MODEL_ROOT'
+  MODEL_DIRECTORY_ENVIRONMENT_VARIABLE = 'INSIGHTFACE_MODEL_DIR'
+  PROVIDER_ENVIRONMENT_VARIABLE = 'INSIGHTFACE_PROVIDER'
+
+--------------------------------------------------------------------------------
+【公开函数】
+--------------------------------------------------------------------------------
+
+  encode_faces(image, array_is_bgr=True) -> list[np.ndarray]
+      检测图片里所有的人脸，每张脸返回一个 512 维 float32 描述向量，
+      且已做 L2 归一化（模长为 1.0）。按检测框面积从大到小排序，
+      所以 list 的第一个元素就是图里最大的人脸。
+      image 支持：文件路径 / pathlib.Path / 图片字节 / numpy 数组。
+      numpy 数组可以是 BGR、RGB 或灰度；array_is_bgr=False 表示数组已经是
+      BGR 之外的顺序（也就是 RGB）。灰度会自动复制成 3 通道；
+      浮点数组如果最大值不超过 1.0 会自动乘 255 当作 0~1 的图。
+      找不到人脸时返回空列表 []（不报错）。
+      路径带中文没问题：内部是读字节再解码，不走 cv2.imread。
+
+  encode_faces_with_scores(image, array_is_bgr=True) -> list[dict]
+      同上，但每项是 {'embedding', 'det_score', 'area'}，
+      多了检测置信度和检测框面积，想在界面上显示「检测得多确定」时用。
+
+  face_similarity_percent(image_a, image_b,
+                          array_is_bgr=True,
+                          compare_all_faces=False) -> float | None
+      返回两张图的人脸相似度百分比，float。
+      任何一张图检测不到人脸时返回 None（不是 0，也不抛异常）。
+      compare_all_faces=False（默认）：各取图里最大的一张脸相比。
+      compare_all_faces=True：两张图里任意两张脸组合中最高的那一对，
+                             适合查询图是合照的情况。
+      结果已限制在 -100 ~ 100 之间，不会因为浮点误差越界。
+      传入的输入类型要求和 encode_faces 一样。
+
+  cosine_similarity_percent(embedding_a, embedding_b) -> float
+      直接比两个已经取好的描述向量，返回百分比。
+      两个向量长度不一致时抛 ValueError。
+
+  best_pair_percent(embeddings_a, embeddings_b, largest_only=False) -> float
+      两组向量之间最高的一对的分数。largest_only=True 时只比各组第一个。
+      example2 和网页版都调它，所以网页和命令行的取脸规则完全一致。
+
+  similarity_matrix_percent(query_embeddings, candidate_embeddings) -> np.ndarray
+      一次矩阵乘法算出「每个候选 × 查询图」的最佳分数，返回 1 维数组。
+      1:N 搜索走这条路径，候选多的时候比 Python 循环快很多。
+
+  to_bgr_array(image, array_is_bgr=True) -> np.ndarray
+      把各种输入统一成连续的 BGR uint8 数组。底层工具函数，
+      一般不需要自己调用。
+
+  get_app(det_threshold=None, det_size=None)
+      返回缓存的 FaceAnalysis 对象，第一次调用时才真正加载模型。
+      同一个进程里之后都是直接返回同一个对象，线程安全。
+      两个参数不传就是用 DET_THRESHOLD 和 DET_SIZE。
+
+  warm_up() -> float
+      加载模型，返回耗时毫秒数。服务端启动时调一次，
+      就不会让第一个用户去承担这 1~2 秒。
+
+  find_model_directory() -> pathlib.Path | None
+      按上面的查找顺序找 buffalo_l 目录，找不到返回 None
+      （None 表示需要下载）。
+
+  model_root() / default_library_directory 相关：
+      model_root()              模型根目录（已展开 ~）
+      default_model_directory()  buffalo_l 应该在的位置
+      resolve_providers()       实际用的 onnxruntime 后端
+      active_providers()        已加载 app 用的后端
+      describe_configuration()  一行摘要，排查环境问题时用
+
+  python insightface_face_similarity.py info
+      打印模型、后端、内存占用之外的关键配置，排查安装问题第一步就跑这个。
+
+--------------------------------------------------------------------------------
+【会抛出的异常】
+--------------------------------------------------------------------------------
+  FileNotFoundError   图片路径不存在
+  ValueError          图片字节损坏（Unsupported or corrupted image data）、
+                      两个描述向量长度不一致
+  RuntimeError        onnxruntime 初始化失败
+
+--------------------------------------------------------------------------------
+【命令行】
+--------------------------------------------------------------------------------
+  python insightface_face_similarity.py <图片A> <图片B>
+      直接比两张图。成功输出 Similarity: 100.00% 这样一行；
+      有一张检测不到人脸则输出 No face was detected in one of the images。
+      参数个数不对时打印 Usage 并以退出码 1 结束。
+      本文件主要还是当库用，命令行只是顺手附带的。
+
+--------------------------------------------------------------------------------
+【典型用法】
+--------------------------------------------------------------------------------
+  from insightface_face_similarity import face_similarity_percent
+
+  percent = face_similarity_percent("查询.jpg", "候选.jpg")
+  if percent is None:
+      print("未检测到人脸")
+  else:
+      print(f"{percent:.2f}%")
+
+  # 1:N：查询图只算一次，候选算一次，之后全靠矩阵乘法
+  from insightface_face_similarity import encode_faces, similarity_matrix_percent
+
+  query = encode_faces("查询.jpg")
+  labels, rows = [], []
+  for path in 候选列表:
+      faces = encode_faces(path)
+      if not faces:
+          continue
+      labels.append(path)
+      rows.append(faces[0])
+  scores = similarity_matrix_percent(query, rows)
+  排名 = sorted(zip(labels, scores), key=lambda r: r[1], reverse=True)
+
+
+================================================================================
+二、flask_insightface_face.py（网页版）
+================================================================================
+
+启动：
+  python flask_insightface_face.py
+  python flask_insightface_face.py --port 5100
+  python flask_insightface_face.py --dir D:\我的照片\人脸库
+  python flask_insightface_face.py --port 5100 --dir D:\人脸库 --library-info
+
+  启动时先加载模型（约 2 秒），然后打印实际地址，
+  形如 Open http://127.0.0.1:5001 in your browser。
+  5000 被占用时会自动往后顺延（最多试 20 个端口），
+  也可以用环境变量 PORT 指定起始端口。
+  浏览器打开后有两个面板，都在同一个页面里，用 AJAX 提交，不整页刷新。
+
+--------------------------------------------------------------------------------
+【两个面板】
+--------------------------------------------------------------------------------
+  ① 查询图 vs 候选图片（1:N）
+     选 1 张查询图 + 多张候选图（浏览器里按住 Ctrl 多选）。
+     只比这次上传的候选，<完全>不读本地人脸库。
+
+  ② 查询图 vs 人脸库目录（1:N）
+     选 1 张查询图 + 填一个文件夹路径，
+     和该文件夹里的全部图片逐个比，递归扫子目录。
+
+  两个面板的结果都按相似度从高到低排名，并显示每条的相似度百分比。
+  ② 的文件夹有三层优先级，网页输入框 > INSIGHTFACE_FACE_LIBRARY_DIR
+  > 脚本同级的 face_library\。所以不用改环境变量、不用重启，
+  在页面上直接粘贴路径就能换一个库。
+
+--------------------------------------------------------------------------------
+【环境变量】
+--------------------------------------------------------------------------------
+  INSIGHTFACE_FACE_LIBRARY_DIR  指定人脸库文件夹；不设置则用 face_library\
+  PORT                        指定起始端口，默认 5000
+  INSIGHTFACE_MODEL_ROOT / INSIGHTFACE_MODEL_DIR / INSIGHTFACE_PROVIDER
+                              同第一节，网页版也认
+
+--------------------------------------------------------------------------------
+【人脸库规则】
+--------------------------------------------------------------------------------
+  递归扫描该文件夹，识别这些扩展名（大小写不敏感）：
+    .jpg  .jpeg  .png  .bmp  .webp
+  一张图里有多张脸时，第一张用文件名，其余记成「文件名 #2」「文件名 #3」。
+  编码结果按「文件路径 + 修改时间」缓存：文件没动就不重复算，
+  文件被改动或删除会自动失效。改了库里的图不用重启。
+  目录里的图片越多，第一次搜索越慢：每张约 0.1~0.3 秒，
+  500 张的库第一次约 1 分钟，之后每次都是矩阵乘法，几十毫秒。
+  终端会打印「载入人脸库 12/500」这样的进度。
+
+--------------------------------------------------------------------------------
+【接口】全部返回 JSON
+--------------------------------------------------------------------------------
+
+  GET  /                      网页本身
+
+  GET  /api/library           人脸库状态
+      可选查询参数 ?dir=某个文件夹
+      返回 {ok, path, images（图片数）, faces（识别到的人脸数）}
+      文件夹不存在返回 HTTP 400：
+        {"ok": false, "error": "人脸库目录不存在: ..."}
+
+  POST /api/query-set         面板 ①
+      表单字段：
+        query       查询图，只能一张文件
+        candidates  候选图，可以多张（同一个字段名传多个文件即可）
+        top_results 返回条数。不传、传空串或传非数字时按 10 处理；
+                     能转成整数时会限制在 1~100（0 和负数变成 1，
+                     超过 100 按 100 截断）。
+      成功返回：
+        ok, mode="query-set", query, query_faces,
+        count（收到的候选数）, compared（成功参与比对的候选数）,
+        matches, skipped, elapsed_ms
+      matches 里每条：
+        rank, kind="候选图片", candidate（文件名）, similarity（百分比）,
+        bar_low, bar_high（相似度条的缩放区间，见下）
+        另外只有第 1 名带 best: true
+      skipped 里每条：name, status
+        原因有两种：「未检测到人脸」和「处理失败：...」
+        某个候选坏了不会影响其它候选照常排名。
+      失败返回 HTTP 400：
+        请选择一张查询图片 / 查询图片只能选一张 / 请至少选择一张候选图片
+        查询图片未检测到人脸：文件名 / 查询图片处理失败：...：文件名
+        候选图片里没有可用的人脸
+
+  POST /api/query-library     面板 ②
+      表单字段：
+        query        查询图，只能一张
+        library_dir  人脸库文件夹，留空用默认
+        top_results  同上
+      成功返回：
+        ok, mode="query-library", query, query_faces,
+        library（实际用的目录）, library_images（目录里图片数）,
+        library_faces（识别到的人脸数）, matches, elapsed_ms
+      失败返回 HTTP 400：
+        人脸库不可用：人脸库目录不存在: ...
+        人脸库里没有图片：...
+        人脸库里没有检测到人脸：...
+        以及和面板 ① 一样的查询图相关错误
+
+  上传体积上限：单次请求 64 MB，超出返回 HTTP 413 和中文错误信息。
+
+--------------------------------------------------------------------------------
+【页面行为要点】
+--------------------------------------------------------------------------------
+  取脸规则：候选图（面板 ① 的候选、人脸库里的图）只取图里最大的一张脸；
+            查询图里的所有人脸都会参与，取最高的一对，
+            所以上传合照也能正常找出最像的那张脸。
+  相似度条会按本次结果的最低分到最高分缩放，因为 ArcFace 的分数本来就挤在
+  40~70 这一段，用固定 0~100 画每条都一样长。表格下方会打印实际缩放区间，
+  左边数值始终是真实相似度。只有一个结果、或所有结果差不到 0.5 时，
+  改用真实的 0~100 尺度。
+  页面上明确写了「和 dlib 版百分比不能互相比较」，
+  也写了「本页只给相似度，不判断是不是同一个人」。
+  橘红色主题，配色全部为暖色，界面里没有蓝色。
+  右上角徽标显示当前人脸库有多少张图、多少张脸；② 的目录输入框
+  失焦时会自动重新统计。
+
+
+================================================================================
+三、example2_insightface.py（命令行 + 双击工具）
+================================================================================
+
+这个文件不改核心库，全部靠 insightface_face_similarity.py 的公开接口实现。
+
+--------------------------------------------------------------------------------
+【命令行用法】
+--------------------------------------------------------------------------------
+  python example2_insightface.py a.jpg b.jpg
+      1:1，只给一个候选时走这种简报格式。
+
+  python example2_insightface.py 查询这是谁.jpg 1用户1.jpg 2用户2.jpg 3帅哥3.jpg
+      1:N，一张查询图逐个比所有候选，按相似度降序排名。
+
+  python example2_insightface.py 查询这是谁.jpg face_library -n 5
+      候选可以直接给文件夹，会递归收图。
+
+  python example2_insightface.py 查询这是谁.jpg face_library --json
+      输出 JSON，便于脚本处理。
+
+--------------------------------------------------------------------------------
+【命令行参数】
+--------------------------------------------------------------------------------
+  -n, --top N         最多显示前 N 条，0 或不写表示全部
+      --largest-only  只比每张图里最大的一张脸，
+                      不写则「查询图任意脸 × 候选任意脸」取最高分
+      --no-recursive  候选文件夹只看第一层
+      --no-bar        不画相似度条
+      --json          输出 JSON
+
+--------------------------------------------------------------------------------
+【双击用法】
+--------------------------------------------------------------------------------
+  直接双击本文件（不带任何参数运行）会先加载模型，然后进入交互模式：
+      1) 1:1  两张图比一次
+      2) 1:N  一张查询图对多个候选，输出排名
+      0) 退出
+  按提示输入路径即可，路径可以直接粘贴，带引号、相对路径、
+  %变量% 都能识别；相对路径找不到时会自动到脚本所在目录再找一次。
+  候选可以填文件夹，会自动递归收图。
+  看完结果按回车回到主菜单，可以连着比很多轮；
+  只有输入 0 才退出，退出时会再要一次回车，防止双击后窗口一闪而过。
+  出错、路径不存在、候选为空时同样回到主菜单，不会关窗口。
+  候选超过 20 张时会在同一行显示「正在提取特征 37/500」进度。
+
+--------------------------------------------------------------------------------
+【输出格式】
+--------------------------------------------------------------------------------
+  进度条固定 10 格。多个候选时按本次的最低分到最高分缩放，
+  这样分数很接近时也能看出差别，表格下方会打印实际缩放区间；
+  只有一个候选、或所有候选分数几乎相同时，改用真实的 0~100 尺度。
+  分数相同时用中点省略号截断过长的文件名（如 ed882a3f85049…a432fc7.jpg）。
+  中文按两个字符宽度对齐，表格控制在 78 列内不会折行。
+  终端编码不支持的符号会自动降级（如 █░─ 变成 #.-）。
+  表格最后会打印一行参考值：同一个人约 45~70，不同人约 0~40。
+  JSON 输出里比 dlib 版多一个 model 字段，值为 "buffalo_l"。
+
+--------------------------------------------------------------------------------
+【可当库用】
+--------------------------------------------------------------------------------
+  from example2_insightface import compare_two, search_candidates, format_report
+
+  compare_two(a, b)                       -> float | None，1:1
+  search_candidates(query, [候选...], top=None, largest_only=False,
+                    show_progress=True)  -> dict，1:N
+      返回 {query, query_faces, model, matches, skipped, elapsed_seconds}
+      matches 每条 {rank, candidate, similarity, faces}
+      skipped 每条 {candidate, reason}
+      查询图无人脸时抛 ValueError
+  format_report(report)                  -> str，排好版的文本
+  format_pair(名字A, 名字B, 分数)          -> str，1:1 的简报
+  expand_candidates([路径或文件夹...])     -> list[Path]，展开并去重
+  resolve_path(文本)                      -> Path | None，认引号/相对路径/环境变量
+
+  退出码
+      0  正常完成（含交互模式正常退出）
+      1  有一张图检测不到人脸，或运行出错
+      2  用法错误、路径不存在、没有可用候选
+
+
+================================================================================
+四、example_insightface.py（最小示例）
+================================================================================
+
+保持最简，只有 6 行，只演示 1:1 的基本调用：
+
+  from insightface_face_similarity import face_similarity_percent
+
+  percent = face_similarity_percent("a.jpg", "b.jpg")
+  if percent is None:
+      print("未检测到人脸")
+  else:
+      print(f"{percent:.2f}%")
+
+需要更多功能请用 example2_insightface.py。
+
+
+================================================================================
+五、四个文件的关系
+================================================================================
+
+  insightface_face_similarity.py  核心，自己就能用，无框架依赖
+          ^
+          |  被依赖
+          |
+  +-------+-------+-----------------+
+  |               |                 |
+example_insightface.py  example2_insightface.py  flask_insightface_face.py
+最小示例          命令行/双击            网页
+
+  example_insightface.py 和 example2_insightface.py 都不依赖 flask；
+  网页也不依赖这两个示例文件。四者唯一的共同依赖就是核心库。
+
+
+================================================================================
+六、和 dlib 版怎么选
+================================================================================
+
+选 InsightFace（buffalo_l），如果：
+  · 准确率是你最在意的（ArcFace 512 维明显强于 dlib 128 维）
+  · 侧脸、模糊、逆光、戴墨镜这些难例比较多（SCRFD + ArcFace 更稳）
+  · 能接受第一次运行要联网下载 320 MB 模型
+
+选 dlib，如果：
+  · 已经在用 dlib 那套，环境里模型文件都齐了
+  · 更看重"零下载"，.dat 文件手动拷过去就能跑
+  · 需要速度，dlib 128 维网络比 ArcFace r50 轻不少
+
+两套可以同时装、同时用，互不影响。它们的相似度百分比不能互相比较，
+所以别把 dlib 的 82% 阈值套到 InsightFace 上。
+
+
+================================================================================
+七、常见问题
+================================================================================
+
+Q 报 Could not find shape_predictor_68_face_landmarks.dat
+A 那是 dlib 版的报错，你跑的是 dlib 那套文件，不是这份。
+
+Q 第一次运行卡住，然后报网络错误
+A 在下载 buffalo_l 模型包（约 320 MB），需要联网。
+  下载好后放在 ~/.insightface/models/buffalo_l/，之后就不需要网了。
+  也可以手动下载 buffalo_l.zip，解压出 buffalo_l 文件夹，
+  放到 insightface_face_similarity.py 同级目录。
+
+Q 怎么确认模型装好了
+A python insightface_face_similarity.py info
+  会打印模型名、维度、执行后端、模型文件位置。
+
+Q 装在别的盘 / 别的用户下面，怎么告诉它
+A 设 INSIGHTFACE_MODEL_DIR 指向那个 buffalo_l 文件夹。
+
+Q 明明装了 CUDA 版 onnxruntime，还是很慢
+A 跑 python insightface_face_similarity.py info 看 providers 是不是
+  CUDAExecutionProvider。显示 CPUExecutionProvider 说明
+  onnxruntime-gpu 没装上或者和 CUDA 版本对不上。
+  强制 CPU：INSIGHTFACE_PROVIDER=CPUExecutionProvider。
+
+Q 报 No face was detected in one of the images
+A 有一张图里没检测到人脸。可以把 det_thresh 调低
+  （get_app(det_threshold=0.3)），或者先确认图里确实有人脸。
+
+Q 同一张图比自己是 100.00%
+A 正常，向量和自己的点积为 1。
+
+Q 不同的人为什么也能到 50%
+A ArcFace 就是这样，撞脸的人分数会很高。所以本工具不替你判断
+  是不是同一个人，阈值要拿自己的数据标定。
+
+Q 分数都很接近，看不出谁更谁
+A 相似度条和命令行表格都已经按本次的分数区间缩放了，
+  左边的数值才是真实分数，直接看数字就行。
+
+Q 同一张脸，单独看 70%，放进大合照里搜就只剩 50%
+A 正常。检测器按 640x640 看整张图，图越大里面的人脸像素越少，
+  特征就没那么稳。把图裁到人脸附近再比，分数会回到 70%。
+  细节见开头「一个容易踩的坑」。
+
+Q 网页打开是 5001 而不是 5000
+A 5000 被别的程序占了，程序会自动顺延，地址以终端打印的为准。
+  也可以 --port 指定。
+
+Q 人脸库改了文件要重启吗
+A 不用。库按文件修改时间缓存，变了会自动重算。
+  目录输入框改路径也不需要重启。
+
+Q 人脸库第一次搜索很慢
+A 第一次要把整个目录逐张过一遍特征，每张 0.1~0.3 秒。
+  500 张大约 1 分钟，之后都走缓存，几十毫秒。
+
+Q 双击后窗口一闪而过
+A 用不带参数的方式运行会停在主菜单等你输入；
+  若确实闪退，说明 Python 关联有问题，建议在命令行里运行看报错信息。
+
+Q 能同时用 dlib 和 InsightFace 出分吗
+A 能，两套文件各自独立，同时装在一个目录里也没问题，
+  导入名不一样，不会冲突。
